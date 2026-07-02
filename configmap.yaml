@@ -1,0 +1,16 @@
+# Config ConfigMap for the Logstash pod — Kibana / centralized-pipeline-management mode.
+# Argo CD syncs this into the cluster. The pipeline itself lives in Kibana (not here).
+# ${ES_CLOUD_ID} / ${ES_API_KEY} resolve from the es-playground k8s Secret at runtime.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qis-synapse-check-config
+  namespace: logstash
+data:
+  logstash.yml: |
+    api.http.host: "0.0.0.0"
+    log.level: info
+    xpack.management.enabled: true
+    xpack.management.pipeline.id: ["qis-synapse-check"]
+    xpack.management.elasticsearch.cloud_id: "${ES_CLOUD_ID}"
+    xpack.management.elasticsearch.api_key: "${ES_API_KEY}"

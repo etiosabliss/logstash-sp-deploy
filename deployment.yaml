@@ -1,0 +1,122 @@
+# entit-89 — Best-practice Logstash Deployment for the daily Synapse check (AKS)
+# ---------------------------------------------------------------------------
+# Every non-obvious field maps to a Kubernetes best-practice check:
+#   - Pod Security Standards "Restricted" profile (securityContext) — the current
+#     standard, enforced via Pod Security Admission (stable since k8s 1.25).
+#   - Official "Configuration Good Practices" (k8s blog, Nov 2025): version-control
+#     everything, common app.kubernetes.io/* labels, kubernetes.io/description
+#     annotation, minimal config (no redundant defaults).
+#
+# Why a Deployment (not a Job/CronJob): Logstash is a long-running daemon and does
+# NOT self-exit after a one-shot jdbc query, so the natural fit is a Deployment that
+# stays up while the jdbc input's own `schedule => "0 6 * * *"` fires the query daily.
+#
+# This is the PLAIN-MANIFEST form (clearest for learning + the local lab).
+# In PROD prefer the ECK operator (kind: Logstash) — it sets the same
+# securityContext/resources/probes but manages config + keystore for you.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qis-synapse-check
+  namespace: logstash                     # <-- the "Elastic namespace" Aumatics created
+  labels:
+    app.kubernetes.io/name: logstash
+    app.kubernetes.io/component: qis-synapse-check
+  annotations:
+    # ✅ kubernetes.io/description — copied into the API so anyone (and tools like
+    # Headlamp/dashboard) can see what this is, even after deploy.
+    kubernetes.io/description: "Daily QIS-Synapse stale-link check (ENTIT-89 / WA2606 147). Logs into Synapse as the SP-ELK-ALG-SQLMON service principal, runs one check query at 06:00, writes results to Elastic; an Elastic rule alerts on rows."
+spec:
+  replicas: 1                             # one daily check — a single instance
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: logstash
+      app.kubernetes.io/component: qis-synapse-check
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: logstash
+        app.kubernetes.io/component: qis-synapse-check
+    spec:
+      # AKS pulls from ACR via the AcrPull managed identity (--attach-acr) — no imagePullSecret needed.
+      securityContext:                    # pod-level (PSS Restricted)
+        runAsNonRoot: true                # ✅ required by Restricted
+        runAsUser: 1000                   # the 'logstash' user in the official image
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault            # ✅ required by Restricted
+      containers:
+        - name: logstash
+          # ✅ PINNED tag + YOUR custom image (mssql-jdbc + msal4j + azure-identity baked in).
+          # Tag by build id / git-SHA, never :latest. (imagePullPolicy omitted — a non-:latest
+          # tag already defaults to IfNotPresent, so setting it is a redundant default.)
+          image: acrlogstashlab18328.azurecr.io/logstash-sp:9.4.3-1
+          imagePullPolicy: Always         # lab: force a real pull from ACR each start (prod: unique tag per build)
+          ports:
+            - name: monitoring
+              containerPort: 9600         # Logstash HTTP API (health probes hit this)
+          resources:                      # ✅ JVM is memory-hungry — always set these
+            requests:
+              cpu: "250m"
+              memory: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+          securityContext:                # container-level (PSS Restricted)
+            allowPrivilegeEscalation: false   # ✅ required by Restricted
+            readOnlyRootFilesystem: true      # ✅ best practice (needs the writable mounts below)
+            capabilities:
+              drop: ["ALL"]                   # ✅ required by Restricted
+          livenessProbe:                  # ✅ "is Logstash alive?"
+            httpGet:
+              path: /
+              port: 9600
+            initialDelaySeconds: 60       # give the JVM + pipeline time to boot
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:                 # ✅ "is it ready to work?"
+            httpGet:
+              path: /
+              port: 9600
+            initialDelaySeconds: 60
+            periodSeconds: 15
+          env:
+            # SP creds come from a k8s Secret — which itself should be SYNCED from Azure Key Vault
+            # (Secrets Store CSI / External Secrets). NEVER in the image, a values file, or git.
+            - name: SYNAPSE_USER
+              valueFrom:
+                secretKeyRef: { name: qis-synapse-sp, key: client-id }
+            - name: SYNAPSE_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: qis-synapse-sp, key: client-secret }
+            # ES playground creds — from the es-playground k8s Secret (api-key never in image/git).
+            - name: ES_CLOUD_ID
+              valueFrom:
+                secretKeyRef: { name: es-playground, key: cloud-id }
+            - name: ES_API_KEY
+              valueFrom:
+                secretKeyRef: { name: es-playground, key: api-key }
+          volumeMounts:
+            # KIBANA MODE: pipeline ConfigMap NOT mounted — the pipeline comes from Kibana centralized mgmt.
+            # For git/ConfigMap mode, re-add: - { name: pipeline, mountPath: /usr/share/logstash/pipeline, readOnly: true }
+            - { name: config,   mountPath: /usr/share/logstash/config/logstash.yml, subPath: logstash.yml, readOnly: true }
+            # readOnlyRootFilesystem: true means Logstash still needs a few WRITABLE dirs.
+            # Mount emptyDir for them or the pod crash-loops:
+            - { name: data, mountPath: /usr/share/logstash/data }
+            - { name: tmp,  mountPath: /tmp }
+      volumes:
+        # KIBANA MODE: no 'pipeline' volume — pipeline lives in Kibana. Re-add it for git/ConfigMap mode.
+        - name: config
+          configMap: { name: qis-synapse-check-config }      # logstash.yml (see note below)
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+
+# ---------------------------------------------------------------------------
+# NOTE — HEALTH PROBES need the Logstash HTTP API reachable from the kubelet.
+# It binds to 127.0.0.1 by default, so a probe on the pod IP fails.
+# In your logstash.yml ConfigMap set:  api.http.host: "0.0.0.0"
+# (Confirm the exact key for your Logstash version before go-live.)
