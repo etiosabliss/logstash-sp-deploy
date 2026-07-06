@@ -38,8 +38,10 @@ spec:
       labels:
         app.kubernetes.io/name: logstash
         app.kubernetes.io/component: qis-synapse-check
+        azure.workload.identity/use: "true"   # ✅ workload-identity webhook injects the SA token
     spec:
       # AKS pulls from ACR via the AcrPull managed identity (--attach-acr) — no imagePullSecret needed.
+      serviceAccountName: logstash-sa     # federated to id-logstash-kv (Key Vault read)
       securityContext:                    # pod-level (PSS Restricted)
         runAsNonRoot: true                # ✅ required by Restricted
         runAsUser: 1000                   # the 'logstash' user in the official image
@@ -106,6 +108,9 @@ spec:
             # Mount emptyDir for them or the pod crash-loops:
             - { name: data, mountPath: /usr/share/logstash/data }
             - { name: tmp,  mountPath: /tmp }
+            # Key Vault CSI mount — the MOUNT is what triggers the driver to fetch the
+            # KV secrets AND sync them into the k8s Secrets (qis-synapse-sp, es-playground).
+            - { name: kv, mountPath: /mnt/kv, readOnly: true }
       volumes:
         # KIBANA MODE: no 'pipeline' volume — pipeline lives in Kibana. Re-add it for git/ConfigMap mode.
         - name: config
@@ -114,6 +119,11 @@ spec:
           emptyDir: {}
         - name: tmp
           emptyDir: {}
+        - name: kv
+          csi:
+            driver: secrets-store.csi.x-k8s.io
+            readOnly: true
+            volumeAttributes: { secretProviderClass: "qis-kv" }
 
 # ---------------------------------------------------------------------------
 # NOTE — HEALTH PROBES need the Logstash HTTP API reachable from the kubelet.
