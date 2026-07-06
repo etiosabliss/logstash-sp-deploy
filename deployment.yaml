@@ -121,7 +121,7 @@ spec:
           emptyDir: {}
         - name: kv
           csi:
-            driver: secrets-store.csi.x-k8s.io
+            driver: secrets-store.csi.k8s.io   # NB: no "x-" — the x- prefix is only in the SPC apiVersion (API group), not the driver name
             readOnly: true
             volumeAttributes: { secretProviderClass: "qis-kv" }
 
